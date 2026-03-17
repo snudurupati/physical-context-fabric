@@ -1,0 +1,12 @@
+services:
+  ros2:
+    build: .
+    platform: linux/arm64
+    ports:
+      - "8765:8765"
+    environment:
+      - TURTLEBOT3_MODEL=burger
+    volumes:
+      - ../ros2_bridge:/workspace/ros2_bridge
+    stdin_open: true
+    tty: true
