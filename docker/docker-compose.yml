@@ -1,12 +1,25 @@
 services:
-  ros2:
-    build: .
-    platform: linux/arm64
+  redis:
+    image: redis:latest
+    container_name: pcf-redis
     ports:
-      - "8765:8765"
-    environment:
-      - TURTLEBOT3_MODEL=burger
+      - "6379:6379"
     volumes:
-      - ../ros2_bridge:/workspace/ros2_bridge
-    stdin_open: true
-    tty: true
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+
+  memgraph:
+    image: memgraph/memgraph-platform
+    container_name: pcf-memgraph
+    ports:
+      - "7687:7687"
+      - "7444:7444"
+      - "3000:3000"
+    volumes:
+      - memgraph-data:/var/lib/memgraph
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  memgraph-data:
