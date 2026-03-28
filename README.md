@@ -221,7 +221,7 @@ Physical AI operators are running fleets. They need operational
 context, not just replay. This is the data engineering layer
 Physical AI is missing.
 
-**Series:** [nadurupati.co](https://nadurupati.co)
+**Series:** [nudurupati.co](https://nudurupati.co)
 
 ---
 
