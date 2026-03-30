@@ -16,13 +16,14 @@ Graph schema:
     (Anomaly)-[:OCCURRED_IN]->(Environment_State)
 
 Ingestion strategy:
-    - Every 10th telemetry event written as Event node
-    - All anomalies written immediately with position context
-    - Robot node upserted on startup
+    - Uses frame_type from edge gateway — no re-detection needed
+    - keyframe/delta events: written every EVENT_WRITE_INTERVAL per robot
+    - anomaly frames: always written immediately
+    - Robot nodes upserted for all fleet robots on startup
+    - Per-robot event counters — no cross-robot interference
 
-Anomaly types detected:
-    unexpected_stop — velocity > 0.1 drops to < 0.01
-    velocity_drop   — velocity drops > 50% in one step
+Fleet robots:
+    robot_001, robot_002, robot_003
 
 Usage:
     source .venv/bin/activate
@@ -36,7 +37,6 @@ Requirements:
 
 from gqlalchemy import Memgraph
 import redis
-import time
 from datetime import datetime
 
 REDIS_HOST = "localhost"
@@ -50,6 +50,10 @@ MEMGRAPH_PORT = 7687
 MEMGRAPH_USER = "admin"
 MEMGRAPH_PASS = "admin"
 
+FLEET_ROBOTS = ["robot_001", "robot_002", "robot_003"]
+EVENT_WRITE_INTERVAL = 100  # write every Nth non-anomaly event per robot
+
+
 def setup_consumer_group(r):
     try:
         r.xgroup_create(STREAM_NAME, CONSUMER_GROUP, id='0', mkstream=True)
@@ -60,12 +64,13 @@ def setup_consumer_group(r):
         else:
             raise
 
+
 def ensure_schema(mg):
-    """Create indexes for fast lookups."""
     mg.execute("CREATE INDEX ON :Robot(robot_id);")
     mg.execute("CREATE INDEX ON :Event(timestamp);")
     mg.execute("CREATE INDEX ON :Anomaly(type);")
     print("Schema indexes created")
+
 
 def upsert_robot(mg, robot_id):
     mg.execute(f"""
@@ -73,9 +78,10 @@ def upsert_robot(mg, robot_id):
         ON CREATE SET r.first_seen = '{datetime.now().isoformat()}'
         ON MATCH SET r.last_seen = '{datetime.now().isoformat()}'
     """)
+    print(f"  ✓ Robot node upserted: {robot_id}")
+
 
 def write_event(mg, data):
-    """Write a telemetry event to Memgraph."""
     mg.execute(f"""
         MATCH (r:Robot {{robot_id: '{data['robot_id']}'}})
         CREATE (e:Event {{
@@ -84,22 +90,34 @@ def write_event(mg, data):
             position_y: {data['position_y']},
             linear_vel: {data['linear_vel']},
             angular_vel: {data['angular_vel']},
-            event_type: '{data['event_type']}'
+            event_type: '{data['event_type']}',
+            frame_type: '{data.get('frame_type', 'delta')}'
         }})
         CREATE (r)-[:GENERATED]->(e)
     """)
 
-def write_anomaly(mg, data, anomaly_type, prev_vel, curr_vel):
-    """Write an anomaly node linked to its triggering event."""
+
+def write_anomaly(mg, data):
+    anomaly_type = data.get("anomaly_type", "unknown")
+    robot_id = data['robot_id']
+
+    # Step 1: ensure Robot node exists (MERGE not MATCH — never silently fails)
     mg.execute(f"""
-        MATCH (r:Robot {{robot_id: '{data['robot_id']}'}})
+        MERGE (r:Robot {{robot_id: '{robot_id}'}})
+        ON CREATE SET r.first_seen = '{datetime.now().isoformat()}'
+        ON MATCH SET r.last_seen = '{datetime.now().isoformat()}'
+    """)
+
+    # Step 2: create Anomaly and relationships separately
+    mg.execute(f"""
+        MATCH (r:Robot {{robot_id: '{robot_id}'}})
         CREATE (a:Anomaly {{
             type: '{anomaly_type}',
             timestamp: '{data['timestamp']}',
             position_x: {data['position_x']},
             position_y: {data['position_y']},
-            prev_velocity: {prev_vel},
-            curr_velocity: {curr_vel},
+            linear_vel: {data['linear_vel']},
+            commanded_linear: {data['commanded_linear']},
             detected_at: '{datetime.now().isoformat()}'
         }})
         CREATE (es:Environment_State {{
@@ -110,7 +128,7 @@ def write_anomaly(mg, data, anomaly_type, prev_vel, curr_vel):
         CREATE (r)-[:EXPERIENCED]->(a)
         CREATE (a)-[:OCCURRED_IN]->(es)
     """)
-    print(f"  ✓ Anomaly written to Memgraph: {anomaly_type} at "
+    print(f"  ✓ [{robot_id}] {anomaly_type} at "
           f"({data['position_x']}, {data['position_y']})")
 
 def main():
@@ -121,13 +139,16 @@ def main():
                   username=MEMGRAPH_USER, password=MEMGRAPH_PASS)
     ensure_schema(mg)
 
-    # Ensure robot node exists
-    upsert_robot(mg, "jazzypi")
+    # Upsert all fleet robots
+    for robot_id in FLEET_ROBOTS:
+        upsert_robot(mg, robot_id)
+
     print("[physical-context-fabric] Memgraph ingest started")
+    print(f"Fleet: {FLEET_ROBOTS}")
     print("-" * 60)
 
-    prev_event = None
-    event_count = 0
+    # Per-robot event counters — no cross-robot interference
+    event_counts = {rid: 0 for rid in FLEET_ROBOTS}
 
     while True:
         events = r.xreadgroup(
@@ -144,26 +165,26 @@ def main():
         for stream, messages in events:
             for msg_id, data in messages:
                 r.xack(STREAM_NAME, CONSUMER_GROUP, msg_id)
-                event_count += 1
 
-                # Write every 10th event to Memgraph (avoid flooding)
-                if event_count % 10 == 0:
+                robot_id = data.get("robot_id", "unknown")
+                frame_type = data.get("frame_type", "delta")
+
+                # Always write anomaly frames immediately
+                if frame_type == "anomaly":
+                    write_anomaly(mg, data)
+                    continue
+
+                # Write keyframes always — they are ground truth anchors
+                if frame_type == "keyframe":
                     write_event(mg, data)
+                    continue
 
-                # Real-time anomaly detection + write to Memgraph
-                if prev_event:
-                    prev_vel = float(prev_event["linear_vel"])
-                    curr_vel = float(data["linear_vel"])
+                # Write delta/heartbeat every Nth event per robot
+                if robot_id in event_counts:
+                    event_counts[robot_id] += 1
+                    if event_counts[robot_id] % EVENT_WRITE_INTERVAL == 0:
+                        write_event(mg, data)
 
-                    if prev_vel > 0.1 and curr_vel < 0.01:
-                        write_anomaly(mg, data, "unexpected_stop",
-                                     prev_vel, curr_vel)
-
-                    elif prev_vel > 0.05 and curr_vel < prev_vel * 0.5:
-                        write_anomaly(mg, data, "velocity_drop",
-                                     prev_vel, curr_vel)
-
-                prev_event = data
 
 if __name__ == '__main__':
     main()
