@@ -17,7 +17,7 @@ this pattern recur?
 jazzypi (Pi 5)                    Mac
 ──────────────────────            ──────────────────────
 ROS2 Jazzy (native)               Foxglove Studio
-TurtleBot3 fake node    ───────►  ws://jazzypi:8765
+Fleet simulation        ───────►  ws://jazzypi:8765
 odom_subscriber.py      ───────►  Redis Streams
                                   Pathway (stream processing)
                                   Memgraph (knowledge graph)
@@ -31,13 +31,12 @@ infrastructure layer. This mirrors real fleet deployments.
 ## Knowledge Graph Schema
 
 ```
-Robot → Task → Event → Anomaly → Environment_State
+Robot → Event → Anomaly → Environment_State
 ```
 
 Core relationships:
-- `(Robot)-[:EXECUTING]->(Task)`
-- `(Task)-[:GENERATED]->(Event)`
-- `(Event)-[:PRECEDED]->(Anomaly)`
+- `(Robot)-[:GENERATED]->(Event)`
+- `(Robot)-[:EXPERIENCED]->(Anomaly)`
 - `(Anomaly)-[:OCCURRED_IN]->(Environment_State)`
 
 The graph answers: *"What was the full context 30 seconds before this failure?"*
@@ -47,7 +46,7 @@ The graph answers: *"What was the full context 30 seconds before this failure?"*
 ## Edge Gateway: Delta + Keyframe + Heartbeat
 
 Raw ROS2 telemetry at 10Hz produces 3.6M events/hour per robot. Writing
-all of it downstream defeats the purpose of a context layer, you just
+all of it downstream defeats the purpose of a context layer — you just
 recreate the replay problem. The edge gateway on jazzypi filters at the
 source:
 
@@ -60,6 +59,28 @@ source:
 
 **Result: 96% bandwidth reduction. Only contextually significant events
 reach the knowledge graph.**
+
+---
+
+## Fleet Simulation
+
+Three TurtleBot3 robots run in isolated ROS2 namespaces on jazzypi,
+each with a different behavior pattern:
+
+| Robot | Behavior | Anomaly pattern |
+|---|---|---|
+| `robot_001` | Continuous circles | Baseline — anomalies on stop |
+| `robot_002` | Stop/start waypoints | Frequent unexpected_stop |
+| `robot_003` | Erratic velocity changes | velocity_drop + unexpected_stop |
+
+All three robots push to a single Redis Stream — the `robot_id` field
+differentiates them downstream. Pathway and Memgraph require zero changes
+to handle multiple robots.
+
+**Verified fleet query results:**
+- `robot_001` — 92 anomalies, hotspots at (-0.5, 0.5) and (0.5, 0.5)
+- `robot_002` — 41 anomalies
+- `robot_003` — 71 anomalies
 
 ---
 
@@ -77,7 +98,7 @@ reach the knowledge graph.**
 ```
 physical-context-fabric/
 ├── ros2_bridge/              # Edge gateway (runs on Pi 5)
-│   └── odom_subscriber.py   # Delta+keyframe+heartbeat gateway
+│   └── odom_subscriber.py   # Fleet delta+keyframe+heartbeat gateway
 ├── stream_pipeline/          # Pathway anomaly detection (runs on Mac)
 │   └── pathway_consumer.py
 ├── context_graph/            # Memgraph schema + ingestion (runs on Mac)
@@ -85,11 +106,16 @@ physical-context-fabric/
 ├── queries/                  # Cypher query library
 │   ├── operational_queries.cypher
 │   └── README.md
-├── docker/                   # Docker setup for Mac development
+├── docker/                   # Docker setup for Mac
 │   ├── Dockerfile
 │   ├── docker-compose.yml
 │   └── docker-compose-mac.yml
-├── sim/                      # Gazebo launch files
+├── sim/                      # Fleet simulation
+│   ├── fleet_launch.py       # 3x TurtleBot3 in namespaces
+│   ├── drive_robot_001.sh    # Continuous circles
+│   ├── drive_robot_002.sh    # Stop/start waypoints
+│   ├── drive_robot_003.sh    # Erratic velocity
+│   └── start_fleet.sh        # One command starts full stack
 └── docs/
 ```
 
@@ -97,10 +123,28 @@ physical-context-fabric/
 
 ## Quick Start
 
-### jazzypi setup (Pi 5)
+### One command — full fleet stack
 
 ```bash
-# Ubuntu 24.04.3 LTS — install ROS2 Jazzy
+bash sim/start_fleet.sh
+```
+
+This starts everything:
+- jazzypi tmux (`pcf`): fleet nodes + drive scripts + foxglove + edge gateway
+- Mac tmux (`pcf-mac`): Pathway consumer + Memgraph ingest
+
+```bash
+# Attach to logs
+ssh ubuntu@jazzypi.local && tmux attach -t pcf     # robot side
+tmux attach -t pcf-mac                              # data side
+```
+
+---
+
+### Manual setup — jazzypi (Pi 5, one time)
+
+```bash
+# Install ROS2 Jazzy on Ubuntu 24.04.3
 sudo apt install -y software-properties-common curl
 sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
   -o /usr/share/keyrings/ros-archive-keyring.gpg
@@ -120,7 +164,7 @@ source ~/pcf-venv/bin/activate
 pip install redis numpy pyyaml
 ```
 
-### Run the robot
+### Manual setup — single robot
 
 ```bash
 # Terminal 1 — start fake node
@@ -158,11 +202,9 @@ REDIS_HOST=<mac-ip> python3 ros2_bridge/odom_subscriber.py
 Expected gateway output:
 ```
 [INFO] Connected to Redis at 192.168.1.94:6379
-[INFO] Edge gateway started | keyframe=30.0s | heartbeat=60.0s | pos_threshold=0.05m
-[INFO] Compression — received=1400 written=56 ratio=4.0% frame=delta
+[INFO] Fleet gateway started | robots=['robot_001', 'robot_002', 'robot_003']
+[INFO] robot_001 | received=1400 written=56 ratio=4.0% frame=delta
 ```
-
-Stop Terminal 2 with Ctrl+C to trigger an `unexpected_stop` anomaly.
 
 ### Mac infrastructure
 
@@ -194,7 +236,7 @@ Open Foxglove Studio → Open connection → Foxglove WebSocket →
 ```json
 {
   "timestamp": "1774705546.681",
-  "robot_id": "jazzypi",
+  "robot_id": "robot_001",
   "position_x": "0.3129",
   "position_y": "0.6493",
   "linear_vel": "0.0",
@@ -209,6 +251,52 @@ Open Foxglove Studio → Open connection → Foxglove WebSocket →
 
 `commanded_linear: 0.2` with `linear_vel: 0.0` — the command said move,
 the robot stopped. That's the context the knowledge graph captures.
+
+---
+
+## Cypher Queries
+
+See `queries/operational_queries.cypher` for the full library.
+Run in Memgraph Lab at `http://localhost:3000`.
+
+> **Memgraph syntax note:** Omit label filters on node variables in
+> relationship patterns and always alias properties in RETURN, using
+> aliases in ORDER BY.
+
+```cypher
+-- Fleet anomaly summary
+MATCH (r)-[:EXPERIENCED]->(a)
+RETURN r.robot_id AS robot, a.type AS anomaly_type, count(a) AS total
+ORDER BY robot, total DESC;
+
+-- Geographic clustering — where do failures occur?
+MATCH (r)-[:EXPERIENCED]->(a)-[:OCCURRED_IN]->(es)
+RETURN r.robot_id AS robot,
+       round(toFloat(a.position_x) * 2) / 2 AS grid_x,
+       round(toFloat(a.position_y) * 2) / 2 AS grid_y,
+       count(a) AS anomalies_in_cell
+ORDER BY robot, anomalies_in_cell DESC
+LIMIT 15;
+```
+
+---
+
+## Coming Next: AI-Powered Q&A Interface
+
+> *"The ChatGPT moment for Robotics is here."*
+
+The knowledge graph answers structured queries. The next layer answers
+natural language questions:
+
+*"Why did robot_001 keep stopping in the top-left quadrant?"*
+*"Which robot is most likely to fail in the next 10 minutes?"*
+*"What was the full context 30 seconds before the last anomaly?"*
+
+Architecture: natural language → LLM → Cypher → Memgraph → natural
+language answer. Grounded entirely in the operational knowledge graph —
+no hallucination, no speculation, only what the robots actually did.
+
+**Status: in progress**
 
 ---
 
@@ -235,3 +323,6 @@ Physical AI is missing.
 - [x] Pathway sliding window metrics + anomaly detection
 - [x] Memgraph knowledge graph ingestion
 - [x] Cypher operational query library
+- [x] Fleet simulation — 3 robots, isolated namespaces, different behaviors
+- [x] Fleet operational queries — anomaly counts, geographic clustering
+- [ ] AI-powered Q&A interface — natural language → Cypher
